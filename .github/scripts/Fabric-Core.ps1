@@ -87,6 +87,11 @@ function Invoke-PhaseInventory {
 
     New-Item -ItemType Directory -Path $script:FabricRoot -Force | Out-Null
     $script:Deadline = (Get-Date).AddMinutes($runtime)
+    # Single source of truth for the RDP countdown overlay — written ONCE.
+    # The timer only READS this file, so the countdown reflects the real
+    # workflow start + runtime_minutes, not whenever FabricAdmin logs in.
+    Set-Content -Path (Join-Path $script:FabricRoot 'deadline.txt') `
+        -Value $script:Deadline.ToString('o') -Encoding ASCII -Force
 
     $os      = Get-CimInstance Win32_OperatingSystem
     $cs      = Get-CimInstance Win32_ComputerSystem
@@ -832,10 +837,13 @@ return [int]((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1KB)
 #  PHASE 2.8 — SESSION UX (Edge auto-open, timer overlay, shortcuts) (full only)
 # ─────────────────────────────────────────────────────────────────────────────
 function Invoke-PhaseSession {
-    Write-Step "Phase 2.8: Session UX — Edge auto-open + timer overlay"
+    Write-Step "Phase 2.8: Session UX — Edge auto-open + remaining-time timer"
     $taskUser = "$env:COMPUTERNAME\$($script:User)"
+    $minutes = [int]$env:FAB_RUNTIME
+    if ($minutes -le 0) { $minutes = 345 }
+    $deadlineFile = Join-Path $script:FabricRoot 'deadline.txt'
 
-    # Edge single-instance bootstrap
+    # ── Edge single-instance bootstrap ─────────────────────────────────────
     $edgeEnsure = Join-Path $script:FabricRoot 'EdgeEnsure.ps1'
     @"
 `$ErrorActionPreference = 'SilentlyContinue'
@@ -862,7 +870,6 @@ Set sh = CreateObject("WScript.Shell")
 sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""$edgeEnsure""", 0, False
 "@ | Set-Content -Path $edgeVbs -Encoding ASCII
 
-    # Run key + logon task (repeated every 5 min → relaunch if closed)
     $runKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
     New-Item -Path $runKey -Force | Out-Null
     Set-ItemProperty -Path $runKey -Name "RDPFabric-EdgeApp" -Value "wscript.exe `"$edgeVbs`"" -Type String -Force
@@ -878,7 +885,6 @@ sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -F
     $startupDir = "C:\Users\$($script:User)\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
     if (Test-Path $startupDir) { Copy-Item -Path $edgeVbs -Destination (Join-Path $startupDir "EdgeApp.vbs") -Force -ErrorAction SilentlyContinue }
 
-    # Edge policy: restore the Fabric site + bookmarks + home button
     $edgePol = "HKLM:\SOFTWARE\Policies\Microsoft\Edge"
     New-Item -Path $edgePol -Force | Out-Null
     New-ItemProperty -Path $edgePol -Name "RestoreOnStartup" -PropertyType DWord -Value 4 -Force | Out-Null
@@ -890,72 +896,102 @@ sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -F
     $bm = @(@{ toplevel_name = "RDP Fabric" }, @{ name = "Fabric App"; url = $StartupUrl }) | ConvertTo-Json -Depth 10 -Compress
     New-ItemProperty -Path $edgePol -Name "ManagedBookmarks" -PropertyType String -Value $bm -Force | Out-Null
 
-    # Fabrict App.url shortcut
     $urlContent = "[InternetShortcut]`r`nURL=$StartupUrl`r`n"
     foreach ($desk in @("C:\Users\Public\Desktop", "C:\Users\$($script:User)\Desktop")) {
         if (Test-Path $desk) { Set-Content -Path (Join-Path $desk "Fabric App.url") -Value $urlContent -Encoding ASCII -Force }
     }
 
-    # ── Timer overlay (HH:MM:SS + "Remaining: N min") ──
+    # ── Remaining-time countdown overlay ───────────────────────────────────
+    # Written as a PARAMETERIZED script (no interpolation → no escaping bugs).
+    # It reads deadline.txt (written once in Phase 0). Fallback only if missing.
     $timerPath = Join-Path $script:FabricRoot 'FabricTimer.ps1'
     $timerLauncher = Join-Path $script:FabricRoot 'FabricTimer.vbs'
-    $minutes = [int]$env:FAB_RUNTIME
-    $timerSrc = @"
-`$ErrorActionPreference = 'SilentlyContinue'
+    $timerScript = @'
+param(
+  [string]$DeadlineFile = 'C:\ProgramData\RDPFabric\deadline.txt',
+  [int]$FallbackMinutes = 345
+)
+$ErrorActionPreference = 'SilentlyContinue'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-`$m = New-Object System.Threading.Mutex(`$false, 'Local\RDPFabricTimerOverlay')
-if (-not `$m.WaitOne(0)) { exit }
-`$deadlineFile = '$($script:FabricRoot)\deadline.txt'
-(Get-Date).AddMinutes($minutes).ToString('o') | Set-Content `$deadlineFile -Encoding ASCII
-try {
-  `$deadline = [datetime]::Parse((Get-Content -Path `$deadlineFile -Raw).Trim(), [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)
-} catch { `$deadline = (Get-Date).AddMinutes($minutes) }
-`$totalMin = $minutes
-`$form = New-Object System.Windows.Forms.Form
-`$form.Text = 'Fabric Timer'
-`$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
-`$form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
-`$form.Location = New-Object System.Drawing.Point(10, 10)
-`$form.ClientSize = New-Object System.Drawing.Size(180, 44)
-`$form.TopMost = `$true; `$form.ShowInTaskbar = `$false
-`$form.BackColor = [System.Drawing.Color]::FromArgb(15, 15, 18); `$form.Opacity = 0.88
-`$lbl = New-Object System.Windows.Forms.Label
-`$lbl.Dock = [System.Windows.Forms.DockStyle]::Fill
-`$lbl.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
-`$lbl.Font = New-Object System.Drawing.Font('Consolas', 11, [System.Drawing.FontStyle]::Bold)
-`$lbl.ForeColor = [System.Drawing.Color]::FromArgb(0, 230, 140)
-`$lbl.Text = 'Remaining: $minutes min'
-`$form.Controls.Add(`$lbl)
-`$dragging = `$false; `$origin = New-Object System.Drawing.Point(0,0)
-`$down = { param(`$s,`$e) if (`$e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { `$script:dragging = `$true; `$script:origin = `$e.Location } }
-`$move = { param(`$s,`$e) if (`$script:dragging) { `$form.Location = New-Object System.Drawing.Point((`$form.Location.X + `$e.X - `$script:origin.X), (`$form.Location.Y + `$e.Y - `$script:origin.Y)) } }
-`$up   = { `$script:dragging = `$false }
-`$lbl.Add_MouseDown(`$down); `$lbl.Add_MouseMove(`$move); `$lbl.Add_MouseUp(`$up)
-`$form.Add_MouseDown(`$down); `$form.Add_MouseMove(`$move); `$form.Add_MouseUp(`$up)
-`$lbl.Add_DoubleClick({ `$form.Location = New-Object System.Drawing.Point(10, 10) })
-`$t = New-Object System.Windows.Forms.Timer; `$t.Interval = 1000
-`$t.Add_Tick({
-  `$remain = `$deadline - (Get-Date); `$total = [math]::Floor(`$remain.TotalSeconds)
-  if (`$total -le 0) { `$lbl.Text = 'Expired'; `$lbl.ForeColor = [System.Drawing.Color]::FromArgb(255,80,80); return }
-  `$h = [math]::Floor(`$total / 3600); `$mm = [math]::Floor((`$total % 3600) / 60); `$s = `$total % 60
-  `$lbl.Text = ('{0:00}:{1:00}:{2:00}  ({3} min left)' -f `$h, `$mm, `$s, `$totalMin)
-  if (`$total -le 300) { `$lbl.ForeColor = [System.Drawing.Color]::FromArgb(255,80,80) }
-  elseif (`$total -le 900) { `$lbl.ForeColor = [System.Drawing.Color]::FromArgb(255,176,32) }
-  else { `$lbl.ForeColor = [System.Drawing.Color]::FromArgb(0,230,140) }
-  if (-not `$form.TopMost) { `$form.TopMost = `$true }
+$mtx = New-Object System.Threading.Mutex($false, 'Local\RDPFabricTimerOverlay')
+if (-not $mtx.WaitOne(0)) { exit }
+$deadline = $null
+if (Test-Path -LiteralPath $DeadlineFile) {
+  $raw = Get-Content -LiteralPath $DeadlineFile -Raw -ErrorAction SilentlyContinue
+  if ($raw) {
+    try {
+      $deadline = [datetime]::Parse($raw.Trim(), [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)
+    } catch { $deadline = $null }
+  }
+}
+if (-not $deadline) { $deadline = (Get-Date).AddMinutes($FallbackMinutes) }
+
+$form = New-Object System.Windows.Forms.Form
+$form.Text = 'Fabric Timer'
+$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+$form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+$form.Location = New-Object System.Drawing.Point(10, 10)
+$form.ClientSize = New-Object System.Drawing.Size(250, 54)
+$form.TopMost = $true
+$form.ShowInTaskbar = $false
+$form.BackColor = [System.Drawing.Color]::FromArgb(15, 15, 18)
+$form.Opacity = 0.88
+
+$lbl = New-Object System.Windows.Forms.Label
+$lbl.Dock = [System.Windows.Forms.DockStyle]::Fill
+$lbl.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+$lbl.Font = New-Object System.Drawing.Font('Consolas', 13, [System.Drawing.FontStyle]::Bold)
+$lbl.ForeColor = [System.Drawing.Color]::FromArgb(0, 230, 140)
+$lbl.Text = '--:--:--'
+$form.Controls.Add($lbl)
+
+$dragging = $false
+$origin = New-Object System.Drawing.Point(0, 0)
+$onDown = { param($s,$e) if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { $script:dragging = $true; $script:origin = $e.Location } }
+$onMove = { param($s,$e) if ($script:dragging) { $form.Location = New-Object System.Drawing.Point(($form.Location.X + $e.X - $script:origin.X), ($form.Location.Y + $e.Y - $script:origin.Y)) } }
+$onUp   = { $script:dragging = $false }
+$lbl.Add_MouseDown($onDown);  $lbl.Add_MouseMove($onMove);  $lbl.Add_MouseUp($onUp)
+$form.Add_MouseDown($onDown); $form.Add_MouseMove($onMove); $form.Add_MouseUp($onUp)
+$lbl.Add_DoubleClick({ $form.Location = New-Object System.Drawing.Point(10, 10) })
+
+$tick = New-Object System.Windows.Forms.Timer
+$tick.Interval = 1000
+$tick.Add_Tick({
+  $remain = $deadline - (Get-Date)
+  $total = [math]::Ceiling($remain.TotalSeconds)
+  if ($total -le 0) {
+    $lbl.Text = 'EXPIRED  00:00:00'
+    $lbl.ForeColor = [System.Drawing.Color]::FromArgb(255, 80, 80)
+    return
+  }
+  $h  = [math]::Floor($total / 3600)
+  $mm = [math]::Floor(($total % 3600) / 60)
+  $ss = $total % 60
+  $left = [math]::Ceiling($total / 60)
+  $lbl.Text = ('{0:00}:{1:00}:{2:00}   ·   {3} min left' -f $h, $mm, $ss, $left)
+  if ($total -le 300)      { $lbl.ForeColor = [System.Drawing.Color]::FromArgb(255, 80, 80) }
+  elseif ($total -le 900)  { $lbl.ForeColor = [System.Drawing.Color]::FromArgb(255, 176, 32) }
+  else                     { $lbl.ForeColor = [System.Drawing.Color]::FromArgb(0, 230, 140) }
+  if (-not $form.TopMost)  { $form.TopMost = $true }
 })
-`$t.Start()
-`$keep = New-Object System.Windows.Forms.Timer; `$keep.Interval = 30000
-`$keep.Add_Tick({ `$form.TopMost = `$false; `$form.TopMost = `$true }); `$keep.Start()
+$tick.Start()
+
+$keepTop = New-Object System.Windows.Forms.Timer
+$keepTop.Interval = 30000
+$keepTop.Add_Tick({ $form.TopMost = $false; $form.TopMost = $true })
+$keepTop.Start()
+
 [System.Windows.Forms.Application]::EnableVisualStyles()
-[System.Windows.Forms.Application]::Run(`$form)
-"@
-    Set-Content -Path $timerPath -Value $timerSrc -Encoding UTF8
-    @"
+[System.Windows.Forms.Application]::Run($form)
+'@
+    Set-Content -Path $timerPath -Value $timerScript -Encoding UTF8
+
+    $vbsLauncher = @"
 Set sh = CreateObject("WScript.Shell")
-sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""$timerPath""", 0, False
-"@ | Set-Content -Path $timerLauncher -Value $vbs -Encoding ASCII
+sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""$timerPath"" -DeadlineFile ""$deadlineFile"" -FallbackMinutes $minutes", 0, False
+"@
+    Set-Content -Path $timerLauncher -Value $vbsLauncher -Encoding ASCII
 
     $tAct  = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$timerLauncher`""
     $tTrig = New-ScheduledTaskTrigger -AtLogOn -User $taskUser
@@ -964,7 +1000,7 @@ sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -F
     Register-ScheduledTask -TaskName "RDPFabric-Timer" -Action $tAct -Trigger $tTrig -Principal $taskPrinc -Settings $tSet -Force | Out-Null
     if (Test-Path $startupDir) { Copy-Item -Path $timerLauncher -Destination (Join-Path $startupDir "FabricTimer.vbs") -Force -ErrorAction SilentlyContinue }
 
-    Write-Log "Session UX armed (Edge auto-open + timer overlay)."
+    Write-Log "Session UX armed (Edge auto-open + remaining-time timer anchored to deadline.txt)."
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1095,7 +1131,7 @@ function Invoke-CycleHandoff {
 # ─────────────────────────────────────────────────────────────────────────────
 function Main {
     Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Cyan
-    Write-Host "║  RDP FABRIC PRO v8.0 'Menlít' — mode: $Mode  ║" -ForegroundColor Cyan
+    Write-Host ("║  RDP FABRIC PRO v8.0 'Menlít' — mode: {0}   ║" -f $Mode) -ForegroundColor Cyan
     Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Cyan
 
     Invoke-PhaseInventory
