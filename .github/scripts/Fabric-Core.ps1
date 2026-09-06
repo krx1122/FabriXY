@@ -901,9 +901,9 @@ sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -F
         if (Test-Path $desk) { Set-Content -Path (Join-Path $desk "Fabric App.url") -Value $urlContent -Encoding ASCII -Force }
     }
 
-    # ── Remaining-time countdown overlay ───────────────────────────────────
-    # Written as a PARAMETERIZED script (no interpolation → no escaping bugs).
-    # It reads deadline.txt (written once in Phase 0). Fallback only if missing.
+    # ── Remaining-time countdown overlay (TIME-ONLY, no suffix) ─────────────
+    # Parameterized script (no interpolation → no escaping bugs). Reads
+    # deadline.txt (written once in Phase 0). ASCII output only → no mojibake.
     $timerPath = Join-Path $script:FabricRoot 'FabricTimer.ps1'
     $timerLauncher = Join-Path $script:FabricRoot 'FabricTimer.vbs'
     $timerScript = @'
@@ -932,7 +932,7 @@ $form.Text = 'Fabric Timer'
 $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
 $form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
 $form.Location = New-Object System.Drawing.Point(10, 10)
-$form.ClientSize = New-Object System.Drawing.Size(250, 54)
+$form.ClientSize = New-Object System.Drawing.Size(120, 34)
 $form.TopMost = $true
 $form.ShowInTaskbar = $false
 $form.BackColor = [System.Drawing.Color]::FromArgb(15, 15, 18)
@@ -961,15 +961,14 @@ $tick.Add_Tick({
   $remain = $deadline - (Get-Date)
   $total = [math]::Ceiling($remain.TotalSeconds)
   if ($total -le 0) {
-    $lbl.Text = 'EXPIRED  00:00:00'
+    $lbl.Text = '00:00:00'
     $lbl.ForeColor = [System.Drawing.Color]::FromArgb(255, 80, 80)
     return
   }
   $h  = [math]::Floor($total / 3600)
   $mm = [math]::Floor(($total % 3600) / 60)
   $ss = $total % 60
-  $left = [math]::Ceiling($total / 60)
-  $lbl.Text = ('{0:00}:{1:00}:{2:00}   ·   {3} min left' -f $h, $mm, $ss, $left)
+  $lbl.Text = ('{0:00}:{1:00}:{2:00}' -f $h, $mm, $ss)
   if ($total -le 300)      { $lbl.ForeColor = [System.Drawing.Color]::FromArgb(255, 80, 80) }
   elseif ($total -le 900)  { $lbl.ForeColor = [System.Drawing.Color]::FromArgb(255, 176, 32) }
   else                     { $lbl.ForeColor = [System.Drawing.Color]::FromArgb(0, 230, 140) }
@@ -1000,7 +999,7 @@ sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -F
     Register-ScheduledTask -TaskName "RDPFabric-Timer" -Action $tAct -Trigger $tTrig -Principal $taskPrinc -Settings $tSet -Force | Out-Null
     if (Test-Path $startupDir) { Copy-Item -Path $timerLauncher -Destination (Join-Path $startupDir "FabricTimer.vbs") -Force -ErrorAction SilentlyContinue }
 
-    Write-Log "Session UX armed (Edge auto-open + remaining-time timer anchored to deadline.txt)."
+    Write-Log "Session UX armed (Edge auto-open + time-only timer anchored to deadline.txt)."
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
